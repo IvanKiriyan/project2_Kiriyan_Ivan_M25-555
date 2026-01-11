@@ -1,1 +1,7 @@
-{}
+{
+  "dishes": [
+    "ID:int",
+    "bludo:str",
+    "recipe:str"
+  ]
+}
