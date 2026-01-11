@@ -1,7 +1,8 @@
 {
-  "dishes": [
+  "users": [
     "ID:int",
-    "bludo:str",
-    "recipe:str"
+    "name:str",
+    "age:int",
+    "is_active:bool"
   ]
 }
