@@ -1,5 +1,7 @@
-def main():
-    print("DB project is running!")
+from .engine import run
+
+def main() -> None:
+    run()
 
 if __name__ == "__main__":
-	main()
+    main()
