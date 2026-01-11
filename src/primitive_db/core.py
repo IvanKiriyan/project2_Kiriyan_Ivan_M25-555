@@ -1,8 +1,10 @@
 """
-Основная логика работы с таблицами
+Основная логика работы с таблицами / итоговый файл с декораторами
 """
 
 from typing import Any
+
+from src.decorators import confirm_action, create_cacher, log_time #импортируем созданные декораторы
 
 SUPPORTED_TYPES = {"int", "str", "bool"}
 
@@ -44,7 +46,8 @@ def create_table(metadata: dict, table_name: str, columns: list[str]) -> dict:
     metadata[table_name] = result_columns
     return metadata
 
-#Функция удаления созданных таблиц
+#Удаление созданных таблиц
+@confirm_action("удаление таблицы")
 def drop_table(metadata: dict, table_name: str) -> dict:
     if table_name not in metadata:
         raise ValueError(f'Таблица "{table_name}" не существует.')
@@ -61,6 +64,7 @@ def format_columns_for_print(columns: list[str]) -> str:
     return ", ".join(columns)
 
 #Обновление логики - CRUD
+@log_time
 def insert(
     metadata: dict,
     table_name: str,
@@ -105,7 +109,9 @@ def insert(
                 raise DbValueError(raw)
 
         elif col_type == "str":
-            if len(raw) >= 2 and ((raw[0] == '"' and raw[-1] == '"') or (raw[0] == "'" and raw[-1] == "'")):
+            if len(raw) >= 2 and (
+                (raw[0] == '"' and raw[-1] == '"') or (raw[0] == "'" and raw[-1] == "'")
+            ):
                 record[col_name] = raw[1:-1]
             else:
                 raise DbValueError(raw)
@@ -116,22 +122,43 @@ def insert(
     table_data.append(record)
     return table_data
 
-#Фукнция select
+
+_SELECT_CACHE = create_cacher()
+
+
+# Фукнция select
+@log_time
 def select(
     table_data: list[dict[str, Any]],
     where_clause: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if where_clause is None:
-        return table_data
+    def compute() -> list[dict[str, Any]]:
+        if where_clause is None:
+            return table_data
 
-    (key, value), = where_clause.items()
-    result: list[dict[str, Any]] = []
+        (key, value), = where_clause.items()
+        result: list[dict[str, Any]] = []
+        for row in table_data:
+            if row.get(key) == value:
+                result.append(row)
+        return result
+
+    max_id = 0
     for row in table_data:
-        if row.get(key) == value:
-            result.append(row)
-    return result
+        row_id = row.get("ID", 0)
+        if isinstance(row_id, int) and row_id > max_id:
+            max_id = row_id
 
-#Функция update для обновления записей
+    if where_clause is None:
+        cache_key = ("select_all", len(table_data), max_id)
+    else:
+        (k, v), = where_clause.items()
+        cache_key = ("select_where", k, v, len(table_data), max_id)
+
+    return _SELECT_CACHE(cache_key, compute)
+
+
+#Update для обновления записей
 def update(
     table_data: list[dict[str, Any]],
     set_clause: dict[str, Any],
@@ -149,7 +176,9 @@ def update(
 
     return table_data, updated_ids
 
-#Функция удаления записей
+
+#Удаление записей
+@confirm_action("удаление записи")
 def delete(
     table_data: list[dict[str, Any]],
     where_clause: dict[str, Any],

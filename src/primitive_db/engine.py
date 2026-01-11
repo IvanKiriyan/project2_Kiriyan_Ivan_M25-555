@@ -1,10 +1,12 @@
 """
-Запуск, игровой цикл и парсинг команд
+Запуск, игровой цикл и парсинг команд / финальный с выводом ошибок через декораторы
 """
 import shlex
 
 import prompt
 from prettytable import PrettyTable
+
+from src.decorators import handle_db_errors
 
 from .core import (
     DbValueError,
@@ -17,12 +19,7 @@ from .core import (
     select,
     update,
 )
-from .utils import (
-    load_metadata,
-    load_table_data,
-    save_metadata,
-    save_table_data,
-)
+from .utils import load_metadata, load_table_data, save_metadata, save_table_data
 
 META_FILEPATH = "db_meta.json"
 
@@ -136,13 +133,191 @@ def _print_table(metadata: dict, table_name: str, rows: list[dict]) -> None:
         table.add_row([row.get(col) for col in columns])
     print(table)
 
-#Основной цикл
+#Декораторы
+@handle_db_errors
+def _cmd_list_tables(metadata: dict) -> None:
+    tables = list_tables(metadata)
+    if not tables:
+        print("Таблиц нет.") #проверка существования таблиц
+    else:
+        for name in tables:
+            print(f"- {name}")
+
+
+@handle_db_errors
+def _cmd_create_table(metadata: dict, rest: list[str]) -> None:
+    if len(rest) < 2:
+        raise DbValueError("create_table")
+
+    table_name = rest[0]
+    columns = rest[1:]
+
+    new_metadata = create_table(metadata, table_name, columns)
+    save_metadata(META_FILEPATH, new_metadata)
+
+    cols_text = format_columns_for_print(new_metadata[table_name])
+    print(f'Таблица "{table_name}" успешно создана со столбцами: {cols_text}')
+
+
+@handle_db_errors
+def _cmd_drop_table(metadata: dict, rest: list[str]) -> None:
+    if len(rest) != 1:
+        raise DbValueError("drop_table")
+
+    table_name = rest[0]
+    new_metadata = drop_table(metadata, table_name)
+
+    if new_metadata is None:
+        return
+
+    save_metadata(META_FILEPATH, new_metadata)
+    print(f'Таблица "{table_name}" успешно удалена.')
+
+
+@handle_db_errors
+def _cmd_insert(metadata: dict, user_input: str, args: list[str]) -> None:
+    if len(args) < 4 or args[1] != "into" or args[3] != "values":
+        raise DbValueError("insert")
+
+    table_name = args[2]
+    table_data = load_table_data(table_name)
+
+    low = user_input.lower()
+    pos = low.find("values")
+    if pos == -1:
+        raise DbValueError("values")
+
+    after = user_input[pos + len("values") :].strip()
+    if not (after.startswith("(") and after.endswith(")")):
+        raise DbValueError(after)
+
+    inside = after[1:-1].strip()
+    values = _split_values(inside)
+
+    table_data = insert(metadata, table_name, values, table_data)
+    save_table_data(table_name, table_data)
+
+    new_id = table_data[-1]["ID"]
+    print(f'Запись с ID={new_id} успешно добавлена в таблицу "{table_name}".')
+
+
+@handle_db_errors
+def _cmd_select(metadata: dict, user_input: str, args: list[str]) -> None:
+    if len(args) < 3 or args[1] != "from":
+        raise DbValueError("select")
+
+    table_name = args[2]
+    table_data = load_table_data(table_name)
+
+    if table_name not in metadata:
+        raise ValueError(f'Таблица "{table_name}" не существует.')
+
+    if len(args) == 3:
+        rows = select(table_data)
+        if not rows:
+            print("Записей нет.")
+        else:
+            _print_table(metadata, table_name, rows)
+        return
+
+    if len(args) >= 5 and args[3] == "where":
+        where_text = user_input.lower().split("where", 1)[1].strip()
+        col, raw = _parse_expr(where_text)
+        value = _cast_by_schema(metadata, table_name, col, raw)
+
+        rows = select(table_data, {col: value})
+        if not rows:
+            print("Записей нет.")
+        else:
+            _print_table(metadata, table_name, rows)
+        return
+
+    raise DbValueError("select")
+
+
+@handle_db_errors
+def _cmd_update(metadata: dict, user_input: str, args: list[str]) -> None:
+    if len(args) < 2:
+        raise DbValueError("update")
+
+    table_name = args[1]
+    table_data = load_table_data(table_name)
+
+    low = user_input.lower()
+    if " set " not in low or " where " not in low:
+        raise DbValueError("update")
+
+    set_part = user_input.split("set", 1)[1].rsplit("where", 1)[0].strip()
+    where_part = user_input.rsplit("where", 1)[1].strip()
+
+    set_col, set_raw = _parse_expr(set_part)
+    where_col, where_raw = _parse_expr(where_part)
+
+    if set_col == "ID":
+        raise DbValueError("ID")
+
+    set_val = _cast_by_schema(metadata, table_name, set_col, set_raw)
+    where_val = _cast_by_schema(metadata, table_name, where_col, where_raw)
+
+    table_data, updated_ids = update(table_data, {set_col: set_val}, {where_col: where_val})
+    if not updated_ids:
+        print("Ошибка: Записи не найдены.")
+        return
+
+    save_table_data(table_name, table_data)
+    print(f'Запись с ID={updated_ids[0]} в таблице "{table_name}" успешно обновлена.')
+
+
+@handle_db_errors
+def _cmd_delete(metadata: dict, user_input: str, args: list[str]) -> None:
+    if len(args) < 4 or args[1] != "from":
+        raise DbValueError("delete")
+
+    table_name = args[2]
+    table_data = load_table_data(table_name)
+
+    if args[3] != "where":
+        raise DbValueError("where")
+
+    where_text = user_input.lower().split("where", 1)[1].strip()
+    col, raw = _parse_expr(where_text)
+    value = _cast_by_schema(metadata, table_name, col, raw)
+
+    result = delete(table_data, {col: value})
+    if result is None:
+        return
+
+    table_data, deleted_ids = result
+    if not deleted_ids:
+        print("Ошибка: Записи не найдены.")
+        return
+
+    save_table_data(table_name, table_data)
+    print(f'Запись с ID={deleted_ids[0]} успешно удалена из таблицы "{table_name}".')
+
+
+@handle_db_errors
+def _cmd_info(metadata: dict, args: list[str]) -> None:
+    if len(args) != 2:
+        raise DbValueError("info")
+
+    table_name = args[1]
+    if table_name not in metadata:
+        raise ValueError(f'Таблица "{table_name}" не существует.')
+
+    table_data = load_table_data(table_name)
+    cols_text = format_columns_for_print(metadata[table_name])
+
+    print(f"Таблица: {table_name}")
+    print(f"Столбцы: {cols_text}")
+    print(f"Количество записей: {len(table_data)}")
+
+#Основной цикл: чтение, парсинг команд, обработка
 def run() -> None:
     print_help()
 
     while True:
         metadata = load_metadata(META_FILEPATH)
-
         user_input = prompt.string(">>>Введите команду: ").strip()
         args = shlex.split(user_input)
 
@@ -151,172 +326,37 @@ def run() -> None:
 
         command, *rest = args
 
-        try:
-            match command:
-                case "exit":
-                    print("Всего доброго!")
-                    return
+        match command:
+            case "exit":
+                print("Всего доброго!")
+                return
 
-                case "help":
-                    print_help()
+            case "help":
+                print_help()
 
-                case "list_tables":
-                    tables = list_tables(metadata)
-                    if not tables:
-                        print("Таблиц нет.")
-                    else:
-                        for name in tables:
-                            print(f"- {name}")
+            case "list_tables":
+                _cmd_list_tables(metadata)
 
-                case "create_table":
-                    if len(rest) < 2:
-                        raise DbValueError("create_table")
+            case "create_table":
+                _cmd_create_table(metadata, rest)
 
-                    table_name = rest[0]
-                    columns = rest[1:]
+            case "drop_table":
+                _cmd_drop_table(metadata, rest)
 
-                    metadata = create_table(metadata, table_name, columns)
-                    save_metadata(META_FILEPATH, metadata)
+            case "insert":
+                _cmd_insert(metadata, user_input, args)
 
-                    cols_text = format_columns_for_print(metadata[table_name])
-                    print(f'Таблица "{table_name}" успешно создана со столбцами: {cols_text}')
+            case "select":
+                _cmd_select(metadata, user_input, args)
 
-                case "drop_table":
-                    if len(rest) != 1:
-                        raise DbValueError("drop_table")
+            case "update":
+                _cmd_update(metadata, user_input, args)
 
-                    table_name = rest[0]
-                    metadata = drop_table(metadata, table_name)
-                    save_metadata(META_FILEPATH, metadata)
-                    print(f'Таблица "{table_name}" успешно удалена.')
+            case "delete":
+                _cmd_delete(metadata, user_input, args)
 
-                case "insert":
-                    if len(args) < 4 or args[1] != "into" or args[3] != "values":
-                        raise DbValueError("insert")
+            case "info":
+                _cmd_info(metadata, args)
 
-                    table_name = args[2]
-                    table_data = load_table_data(table_name)
-
-                    low = user_input.lower()
-                    pos = low.find("values")
-                    if pos == -1:
-                        raise DbValueError("values")
-
-                    after = user_input[pos + len("values") :].strip()
-                    if not (after.startswith("(") and after.endswith(")")):
-                        raise DbValueError(after)
-
-                    inside = after[1:-1].strip()
-                    values = _split_values(inside)
-
-                    table_data = insert(metadata, table_name, values, table_data)
-                    save_table_data(table_name, table_data)
-
-                    new_id = table_data[-1]["ID"]
-                    print(f'Запись с ID={new_id} успешно добавлена в таблицу "{table_name}".')
-
-                case "select":
-                    if len(args) < 3 or args[1] != "from":
-                        raise DbValueError("select")
-
-                    table_name = args[2]
-                    table_data = load_table_data(table_name)
-
-                    if len(args) == 3:
-                        rows = select(table_data)
-                        if not rows:
-                            print("Записей нет.")
-                        else:
-                            _print_table(metadata, table_name, rows)
-                        continue
-
-                    if len(args) >= 5 and args[3] == "where":
-                        where_text = user_input.lower().split("where", 1)[1].strip()
-                        col, raw = _parse_expr(where_text)
-                        value = _cast_by_schema(metadata, table_name, col, raw)
-
-                        rows = select(table_data, {col: value})
-                        if not rows:
-                            print("Записей нет.")
-                        else:
-                            _print_table(metadata, table_name, rows)
-                        continue
-
-                    raise DbValueError("select")
-
-                case "update":
-                    if len(args) < 2:
-                        raise DbValueError("update")
-
-                    table_name = args[1]
-                    table_data = load_table_data(table_name)
-
-                    low = user_input.lower()
-                    if " set " not in low or " where " not in low:
-                        raise DbValueError("update")
-
-                    set_part = user_input.split("set", 1)[1].rsplit("where", 1)[0].strip()
-                    where_part = user_input.rsplit("where", 1)[1].strip()
-
-                    set_col, set_raw = _parse_expr(set_part)
-                    where_col, where_raw = _parse_expr(where_part)
-
-                    if set_col == "ID":
-                        raise DbValueError("ID")
-
-                    set_val = _cast_by_schema(metadata, table_name, set_col, set_raw)
-                    where_val = _cast_by_schema(metadata, table_name, where_col, where_raw)
-
-                    table_data, updated_ids = update(table_data, {set_col: set_val}, {where_col: where_val})
-                    if not updated_ids:
-                        print("Ошибка: Записи не найдены.")
-                        continue
-
-                    save_table_data(table_name, table_data)
-                    print(f'Запись с ID={updated_ids[0]} в таблице "{table_name}" успешно обновлена.')
-
-                case "delete":
-                    if len(args) < 4 or args[1] != "from":
-                        raise DbValueError("delete")
-
-                    table_name = args[2]
-                    table_data = load_table_data(table_name)
-
-                    if args[3] != "where":
-                        raise DbValueError("where")
-
-                    where_text = user_input.lower().split("where", 1)[1].strip()
-                    col, raw = _parse_expr(where_text)
-                    value = _cast_by_schema(metadata, table_name, col, raw)
-
-                    table_data, deleted_ids = delete(table_data, {col: value})
-                    if not deleted_ids:
-                        print("Ошибка: Записи не найдены.")
-                        continue
-
-                    save_table_data(table_name, table_data)
-                    print(f'Запись с ID={deleted_ids[0]} успешно удалена из таблицы "{table_name}".')
-
-                case "info":
-                    if len(args) != 2:
-                        raise DbValueError("info")
-
-                    table_name = args[1]
-                    if table_name not in metadata:
-                        raise ValueError(f'Таблица "{table_name}" не существует.')
-
-                    table_data = load_table_data(table_name)
-                    cols_text = format_columns_for_print(metadata[table_name])
-
-                    print(f"Таблица: {table_name}")
-                    print(f"Столбцы: {cols_text}")
-                    print(f"Количество записей: {len(table_data)}")
-
-                case _:
-                    print(f"Функции {command} нет. Попробуйте снова.")
-
-        except DbValueError as e:
-            #Вывод ошибок
-            print(f"Некорректное значение: {e}. Попробуйте снова.")
-        except ValueError as e:
-            print(f"Ошибка: {e}")
+            case _:
+                print(f"Функции {command} нет. Попробуйте снова.")
